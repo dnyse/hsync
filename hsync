@@ -73,6 +73,20 @@ load_config() {
     fi
 }
 
+# Parse SSH config for available hosts
+get_ssh_hosts() {
+    local ssh_config="$HOME/.ssh/config"
+    if [ ! -f "$ssh_config" ]; then
+        return
+    fi
+    
+    # Extract all Host entries (excluding wildcards)
+    grep "^Host " "$ssh_config" | \
+        awk '{for(i=2;i<=NF;i++) print $i}' | \
+        grep -v '\*' | \
+        sort -u
+}
+
 # Initialize configuration
 init_config() {
     if [ -f "$CONFIG_FILE" ]; then
@@ -86,39 +100,39 @@ init_config() {
     
     echo "Creating hsync configuration..."
     echo
-    echo "Available remote hosts:"
-    echo "  1) fritz   (NHR@FAU - Fritz cluster)"
-    echo "  2) alex    (NHR@FAU - Alex cluster)"
-    echo "  3) meluxina (LuxProvide)"
-    echo "  4) custom"
-    echo
-    read -p "Select remote (1-4): " choice
     
-    case $choice in
-        1)
-            REMOTE_HOST="fritz"
-            read -p "Enter remote path (e.g., ~/exercises/assignment05): " remote_path
-            REMOTE_PATH="$remote_path"
-            ;;
-        2)
-            REMOTE_HOST="alex"
-            read -p "Enter remote path (e.g., ~/exercises/assignment05): " remote_path
-            REMOTE_PATH="$remote_path"
-            ;;
-        3)
-            REMOTE_HOST="meluxina"
-            read -p "Enter remote path (e.g., ~/exercises/assignment05): " remote_path
-            REMOTE_PATH="$remote_path"
-            ;;
-        4)
+    # Get available SSH hosts
+    local ssh_hosts=($(get_ssh_hosts))
+    
+    if [ ${#ssh_hosts[@]} -gt 0 ]; then
+        echo -e "${GREEN}Available hosts from ~/.ssh/config:${NC}"
+        local i=1
+        for host in "${ssh_hosts[@]}"; do
+            echo "  $i) $host"
+            ((i++))
+        done
+        echo "  $i) custom (enter manually)"
+        echo
+        
+        read -p "Select remote (1-$i): " choice
+        
+        if [ "$choice" -eq "$i" ] 2>/dev/null; then
+            # Custom host
             read -p "Enter remote host (SSH config name or hostname): " REMOTE_HOST
-            read -p "Enter remote path: " REMOTE_PATH
-            ;;
-        *)
+        elif [ "$choice" -ge 1 ] 2>/dev/null && [ "$choice" -lt "$i" ]; then
+            # Selected from list
+            REMOTE_HOST="${ssh_hosts[$((choice-1))]}"
+        else
             echo "Invalid choice"
             exit 1
-            ;;
-    esac
+        fi
+    else
+        echo -e "${YELLOW}No hosts found in ~/.ssh/config${NC}"
+        read -p "Enter remote host (hostname): " REMOTE_HOST
+    fi
+    
+    read -p "Enter remote path (e.g., ~/exercises/assignment05): " remote_path
+    REMOTE_PATH="$remote_path"
     
     cat > "$CONFIG_FILE" << EOF
 # hsync configuration
