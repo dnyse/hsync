@@ -1,4 +1,4 @@
-# hsync
+# hsync - WIP
 
 A lightweight file synchronization tool for working with remote HPC clusters. Built for personal use to streamline the workflow between local Neovim development and remote cluster execution.
 
