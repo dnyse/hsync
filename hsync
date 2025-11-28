@@ -1,0 +1,492 @@
+#!/bin/bash
+# hsync - Portable HPC sync tool
+# Place this script in your project root directory along with .hsync.conf
+
+set -e
+
+# Color output
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+NC='\033[0m' # No Color
+
+# Find project root (current working directory)
+# This allows hsync to be installed globally or in project directory
+PROJECT_ROOT="$(pwd)"
+
+# Default configuration
+CONFIG_FILE="$PROJECT_ROOT/.hsync.conf"
+STATE_FILE="$PROJECT_ROOT/.hsync.state"
+
+# Default values
+REMOTE_HOST=""
+REMOTE_PATH=""
+EXCLUDES=(
+    ".git/"
+    ".hsync.conf"
+    ".hsync.state"
+    "hsync"
+    "__pycache__/"
+    "*.pyc"
+    "*.pyo"
+    "*.o"
+    "*.out"
+    "*.so"
+    "slurm-*.out"
+    "core.*"
+    "build/"
+    "venv/"
+    ".venv/"
+    "*.swp"
+    "*.swo"
+    "*~"
+    ".DS_Store"
+)
+DRY_RUN=false
+VERBOSE=false
+DELETE=true
+COMPRESS=true
+
+# Load configuration
+load_config() {
+    if [ -f "$CONFIG_FILE" ]; then
+        source "$CONFIG_FILE"
+    else
+        echo -e "${RED}Error: Configuration file not found: $CONFIG_FILE${NC}"
+        echo "Run: $0 init"
+        exit 1
+    fi
+    
+    if [ -z "$REMOTE_HOST" ] || [ -z "$REMOTE_PATH" ]; then
+        echo -e "${RED}Error: REMOTE_HOST and REMOTE_PATH must be set in $CONFIG_FILE${NC}"
+        exit 1
+    fi
+    
+    # Expand tilde in REMOTE_PATH if it starts with ~/
+    if [[ "$REMOTE_PATH" == "~/"* ]]; then
+        # Get remote home directory and expand the path
+        local remote_home=$(ssh "$REMOTE_HOST" "echo \$HOME" 2>/dev/null)
+        if [ -n "$remote_home" ]; then
+            REMOTE_PATH="${REMOTE_PATH/#\~/$remote_home}"
+        fi
+    fi
+}
+
+# Initialize configuration
+init_config() {
+    if [ -f "$CONFIG_FILE" ]; then
+        echo -e "${YELLOW}Configuration file already exists: $CONFIG_FILE${NC}"
+        read -p "Overwrite? (y/N) " -n 1 -r
+        echo
+        if [[ ! $REPLY =~ ^[Yy]$ ]]; then
+            exit 0
+        fi
+    fi
+    
+    echo "Creating hsync configuration..."
+    echo
+    echo "Available remote hosts:"
+    echo "  1) fritz   (NHR@FAU - Fritz cluster)"
+    echo "  2) alex    (NHR@FAU - Alex cluster)"
+    echo "  3) meluxina (LuxProvide)"
+    echo "  4) custom"
+    echo
+    read -p "Select remote (1-4): " choice
+    
+    case $choice in
+        1)
+            REMOTE_HOST="fritz"
+            read -p "Enter remote path (e.g., ~/exercises/assignment05): " remote_path
+            REMOTE_PATH="$remote_path"
+            ;;
+        2)
+            REMOTE_HOST="alex"
+            read -p "Enter remote path (e.g., ~/exercises/assignment05): " remote_path
+            REMOTE_PATH="$remote_path"
+            ;;
+        3)
+            REMOTE_HOST="meluxina"
+            read -p "Enter remote path (e.g., ~/exercises/assignment05): " remote_path
+            REMOTE_PATH="$remote_path"
+            ;;
+        4)
+            read -p "Enter remote host (SSH config name or hostname): " REMOTE_HOST
+            read -p "Enter remote path: " REMOTE_PATH
+            ;;
+        *)
+            echo "Invalid choice"
+            exit 1
+            ;;
+    esac
+    
+    cat > "$CONFIG_FILE" << EOF
+# hsync configuration
+# Remote host (as defined in ~/.ssh/config)
+REMOTE_HOST="$REMOTE_HOST"
+
+# Remote path (can use ~ for home directory)
+REMOTE_PATH="$REMOTE_PATH"
+
+# Additional excludes (one per line, patterns relative to project root)
+# EXCLUDES+=(
+#     "data/"
+#     "*.log"
+# )
+
+# Sync options
+DELETE=true          # Delete files on destination that don't exist on source
+COMPRESS=true        # Use compression during transfer
+VERBOSE=false        # Verbose output
+
+# Rsync options (advanced)
+# RSYNC_OPTS="--partial --progress"
+EOF
+    
+    echo -e "${GREEN}✓ Configuration created: $CONFIG_FILE${NC}"
+    echo
+    echo "You can now run:"
+    echo "  $0 push    # Push local changes to remote"
+    echo "  $0 pull    # Pull remote changes to local"
+    echo "  $0 auto    # Auto-detect direction and sync"
+    echo "  $0 status  # Show sync status"
+}
+
+# Build rsync exclude arguments
+build_exclude_args() {
+    local exclude_args=""
+    for pattern in "${EXCLUDES[@]}"; do
+        exclude_args="$exclude_args --exclude=$pattern"
+    done
+    echo "$exclude_args"
+}
+
+# Build rsync options
+build_rsync_opts() {
+    local opts="-a"
+    
+    if [ "$COMPRESS" = true ]; then
+        opts="$opts -z"
+    fi
+    
+    if [ "$VERBOSE" = true ]; then
+        opts="$opts -v"
+    fi
+    
+    if [ "$DELETE" = true ]; then
+        opts="$opts --delete"
+    fi
+    
+    if [ "$DRY_RUN" = true ]; then
+        opts="$opts -n"
+    fi
+    
+    # Add any custom rsync options
+    if [ -n "$RSYNC_OPTS" ]; then
+        opts="$opts $RSYNC_OPTS"
+    fi
+    
+    echo "$opts"
+}
+
+# Get last modification time
+get_latest_mtime() {
+    local path=$1
+    local is_remote=$2
+    
+    if [ "$is_remote" = "remote" ]; then
+        ssh "$REMOTE_HOST" "find \"$path\" -type f -printf '%T@\n' 2>/dev/null | sort -n | tail -1" 2>/dev/null || echo "0"
+    else
+        find "$path" -type f -printf '%T@\n' 2>/dev/null | sort -n | tail -1 || echo "0"
+    fi
+}
+
+# Get file count
+get_file_count() {
+    local path=$1
+    local is_remote=$2
+    
+    if [ "$is_remote" = "remote" ]; then
+        ssh "$REMOTE_HOST" "find \"$path\" -type f 2>/dev/null | wc -l" 2>/dev/null || echo "0"
+    else
+        find "$path" -type f 2>/dev/null | wc -l || echo "0"
+    fi
+}
+
+# Save state
+save_state() {
+    local direction=$1
+    local timestamp=$(date -Iseconds)
+    echo "LAST_SYNC=\"$timestamp\"" > "$STATE_FILE"
+    echo "LAST_DIRECTION=\"$direction\"" >> "$STATE_FILE"
+}
+
+# Load state
+load_state() {
+    if [ -f "$STATE_FILE" ]; then
+        source "$STATE_FILE"
+    fi
+}
+
+# Show status
+show_status() {
+    load_config
+    load_state
+    
+    echo -e "${BLUE}=== Sync Status ===${NC}"
+    echo "Project:      $(basename "$PROJECT_ROOT")"
+    echo "Local path:   $PROJECT_ROOT"
+    echo "Remote:       $REMOTE_HOST:$REMOTE_PATH"
+    echo
+    
+    # Check if remote exists (with timeout for slow connections)
+    echo -e "${BLUE}Checking remote...${NC}"
+    if timeout 5 ssh "$REMOTE_HOST" "test -d \"$REMOTE_PATH\"" 2>/dev/null; then
+        echo -e "${GREEN}✓ Remote directory exists${NC}"
+    else
+        echo -e "${YELLOW}⚠ Remote directory check failed or timed out${NC}"
+        echo "Run: hsync push  (to create/sync)"
+        return
+    fi
+    
+    # Get file counts
+    local_count=$(get_file_count "$PROJECT_ROOT" "local")
+    echo "Local files:  $local_count"
+    
+    remote_count=$(timeout 5 get_file_count "$REMOTE_PATH" "remote" 2>/dev/null || echo "?")
+    echo "Remote files: $remote_count"
+    echo
+    
+    # Get last modification times
+    echo -e "${BLUE}Checking timestamps...${NC}"
+    local_mtime=$(get_latest_mtime "$PROJECT_ROOT" "local")
+    remote_mtime=$(timeout 5 get_latest_mtime "$REMOTE_PATH" "remote" 2>/dev/null || echo "0")
+    
+    if [ "$local_mtime" != "0" ]; then
+        local_date=$(date -d "@$local_mtime" "+%Y-%m-%d %H:%M:%S" 2>/dev/null || echo "unknown")
+        echo "Local last modified:  $local_date"
+    fi
+    
+    if [ "$remote_mtime" != "0" ]; then
+        remote_date=$(date -d "@$remote_mtime" "+%Y-%m-%d %H:%M:%S" 2>/dev/null || echo "unknown")
+        echo "Remote last modified: $remote_date"
+    fi
+    
+    echo
+    
+    if [ -n "$LAST_SYNC" ]; then
+        echo "Last sync: $LAST_SYNC ($LAST_DIRECTION)"
+        echo
+    fi
+    
+    # Suggest action
+    if [ "$remote_mtime" = "0" ]; then
+        echo -e "${YELLOW}⚠ Could not get remote timestamp (slow connection?)${NC}"
+        echo -e "${GREEN}→ Suggestion: use 'hsync push' or 'hsync pull' explicitly${NC}"
+    elif (( $(echo "$local_mtime > $remote_mtime" | bc -l) )); then
+        echo -e "${GREEN}→ Suggestion: push (local is newer)${NC}"
+    elif (( $(echo "$remote_mtime > $local_mtime" | bc -l) )); then
+        echo -e "${GREEN}← Suggestion: pull (remote is newer)${NC}"
+    else
+        echo -e "${GREEN}✓ In sync${NC}"
+    fi
+}
+
+# Push to remote
+push() {
+    load_config
+    
+    echo -e "${BLUE}→ Pushing to $REMOTE_HOST...${NC}"
+    
+    local exclude_args=$(build_exclude_args)
+    local rsync_opts=$(build_rsync_opts)
+    
+    # Create remote directory if it doesn't exist (silently, rsync will handle errors)
+    ssh "$REMOTE_HOST" "mkdir -p \"$REMOTE_PATH\"" 2>/dev/null || true
+    
+    # Perform sync
+    eval "rsync $rsync_opts $exclude_args \"$PROJECT_ROOT/\" \"$REMOTE_HOST:$REMOTE_PATH/\""
+    
+    if [ $? -eq 0 ]; then
+        if [ "$DRY_RUN" = false ]; then
+            save_state "push"
+            echo -e "${GREEN}✓ Push completed${NC}"
+        else
+            echo -e "${YELLOW}Dry run completed (no changes made)${NC}"
+        fi
+    else
+        echo -e "${RED}✗ Push failed${NC}"
+        echo "Try: ssh $REMOTE_HOST 'mkdir -p \"$REMOTE_PATH\"'"
+        exit 1
+    fi
+}
+
+# Pull from remote
+pull() {
+    load_config
+    
+    echo -e "${BLUE}← Pulling from $REMOTE_HOST...${NC}"
+    
+    # Check if remote exists
+    if ! ssh "$REMOTE_HOST" "test -d \"$REMOTE_PATH\"" 2>/dev/null; then
+        echo -e "${RED}Error: Remote directory does not exist: $REMOTE_PATH${NC}"
+        exit 1
+    fi
+    
+    local exclude_args=$(build_exclude_args)
+    local rsync_opts=$(build_rsync_opts)
+    
+    # Perform sync
+    eval "rsync $rsync_opts $exclude_args \"$REMOTE_HOST:$REMOTE_PATH/\" \"$PROJECT_ROOT/\""
+    
+    if [ $? -eq 0 ]; then
+        if [ "$DRY_RUN" = false ]; then
+            save_state "pull"
+            echo -e "${GREEN}✓ Pull completed${NC}"
+        else
+            echo -e "${YELLOW}Dry run completed (no changes made)${NC}"
+        fi
+    else
+        echo -e "${RED}✗ Pull failed${NC}"
+        exit 1
+    fi
+}
+
+# Auto-detect direction
+auto_sync() {
+    load_config
+    
+    echo -e "${BLUE}Detecting changes...${NC}"
+    
+    # Try to check if remote exists, but don't fail if check is slow/unreliable
+    local remote_exists=false
+    if ssh "$REMOTE_HOST" "test -d \"$REMOTE_PATH\"" 2>/dev/null; then
+        remote_exists=true
+    fi
+    
+    if [ "$remote_exists" = false ]; then
+        echo -e "${YELLOW}Remote directory doesn't exist or couldn't verify. Creating and pushing...${NC}"
+        push
+        return
+    fi
+    
+    # Get modification times
+    local_mtime=$(get_latest_mtime "$PROJECT_ROOT" "local")
+    remote_mtime=$(get_latest_mtime "$REMOTE_PATH" "remote")
+    
+    if [ "$local_mtime" = "0" ] && [ "$remote_mtime" = "0" ]; then
+        echo -e "${YELLOW}No files found in either location${NC}"
+        exit 0
+    fi
+    
+    # Compare and sync
+    if (( $(echo "$local_mtime > $remote_mtime" | bc -l) )); then
+        echo -e "${GREEN}Local is newer${NC}"
+        push
+    elif (( $(echo "$remote_mtime > $local_mtime" | bc -l) )); then
+        echo -e "${GREEN}Remote is newer${NC}"
+        pull
+    else
+        echo -e "${GREEN}✓ Already in sync${NC}"
+    fi
+}
+
+# Show help
+show_help() {
+    cat << EOF
+hsync - Portable HPC sync tool
+
+Usage: $0 <command> [options]
+
+Commands:
+    init        Initialize configuration in current directory
+    push        Push local changes to remote
+    pull        Pull remote changes to local
+    auto        Auto-detect direction and sync
+    status      Show sync status and suggestions
+    help        Show this help message
+
+Options:
+    -n, --dry-run    Show what would be transferred without making changes
+    -v, --verbose    Verbose output
+    --no-delete      Don't delete files on destination
+    --no-compress    Don't use compression
+
+Examples:
+    $0 init                 # First time setup
+    $0 status               # Check sync status
+    $0 auto                 # Auto-sync (recommended)
+    $0 push                 # Force push to remote
+    $0 pull -n              # Dry-run pull from remote
+    $0 push -v --no-delete  # Verbose push without deleting files
+
+Configuration:
+    Edit .hsync.conf in project root to customize behavior
+    
+Remote hosts (configure in ~/.ssh/config):
+    fritz       NHR@FAU Fritz cluster
+    alex        NHR@FAU Alex cluster
+    meluxina    LuxProvide MeluXina
+
+For more info: https://doc.nhr.fau.de/data/copying/
+EOF
+}
+
+# Parse arguments
+COMMAND=""
+while [[ $# -gt 0 ]]; do
+    case $1 in
+        init|push|pull|auto|status|help)
+            COMMAND=$1
+            shift
+            ;;
+        -n|--dry-run)
+            DRY_RUN=true
+            shift
+            ;;
+        -v|--verbose)
+            VERBOSE=true
+            shift
+            ;;
+        --no-delete)
+            DELETE=false
+            shift
+            ;;
+        --no-compress)
+            COMPRESS=false
+            shift
+            ;;
+        *)
+            echo "Unknown option: $1"
+            show_help
+            exit 1
+            ;;
+    esac
+done
+
+# Execute command
+case $COMMAND in
+    init)
+        init_config
+        ;;
+    push)
+        push
+        ;;
+    pull)
+        pull
+        ;;
+    auto)
+        auto_sync
+        ;;
+    status)
+        show_status
+        ;;
+    help|"")
+        show_help
+        ;;
+    *)
+        echo "Unknown command: $COMMAND"
+        show_help
+        exit 1
+        ;;
+esac
